@@ -41,11 +41,7 @@ static uint16_t tmp_id = 1000;
 struct nano_ctx {
 	nano_sock *sock;
 	uint32_t   pipe_id;
-	// when resending
-	nano_pipe    *spipe, *qos_pipe; // send pipe
-	nni_aio      *saio;             // send aio
-	nni_aio      *raio;             // recv aio
-	nni_list_node sqnode;
+	nni_aio      *raio; // recv aio
 	nni_list_node rqnode;
 };
 
@@ -298,13 +294,6 @@ nano_ctx_close(void *arg)
 
 	log_trace("nano_ctx_close");
 	nni_mtx_lock(&s->lk);
-	if ((aio = ctx->saio) != NULL) {
-		// nano_pipe *pipe = ctx->spipe;
-		ctx->saio     = NULL;
-		ctx->spipe    = NULL;
-		ctx->qos_pipe = NULL;
-		nni_aio_finish_error(aio, NNG_ECLOSED);
-	}
 	if ((aio = ctx->raio) != NULL) {
 		nni_list_remove(&s->recvq, ctx);
 		ctx->raio = NULL;
@@ -329,62 +318,24 @@ nano_ctx_init(void *carg, void *sarg)
 	nano_ctx  *ctx = carg;
 
 	log_trace("&&&&&&&& nano_ctx_init %p &&&&&&&&&", ctx);
-	NNI_LIST_NODE_INIT(&ctx->sqnode);
 	NNI_LIST_NODE_INIT(&ctx->rqnode);
 
 	ctx->sock    = s;
 	ctx->pipe_id = 0;
 }
 
-static void
-nano_ctx_cancel_send(nni_aio *aio, void *arg, int rv)
+static int
+nano_ctx_send_msg(nano_ctx *ctx, uint32_t pipe, nni_msg *msg)
 {
-	nano_ctx  *ctx = arg;
-	nano_sock *s   = ctx->sock;
-
-	log_trace("*********** nano_ctx_cancel_send ***********");
-	nni_mtx_lock(&s->lk);
-	if (ctx->saio != aio) {
-		nni_mtx_unlock(&s->lk);
-		return;
-	}
-	nni_list_node_remove(&ctx->sqnode);
-	ctx->saio = NULL;
-	nni_mtx_unlock(&s->lk);
-
-	nni_msg_header_clear(nni_aio_get_msg(aio)); // reset the headers
-	nni_aio_finish_error(aio, rv);
-}
-
-static void
-nano_ctx_send(void *arg, nni_aio *aio)
-{
-	nano_ctx  *ctx = arg;
 	nano_sock *s   = ctx->sock;
 	nano_pipe *p;
-	nni_msg   *msg;
 	int        rv;
 	bool       warn_queue_full = false;
-	uint32_t   pipe = 0;
-	uint32_t  *pipeid;
 
 	bool is_sqlite = s->conf->sqlite.enable;
 
-	msg = nni_aio_get_msg(aio);
-
-	if (nni_aio_begin(aio) != 0) {
-		nni_msg_free(msg);
-		log_error("Aio misuesed!");
-		return;
-	}
-
 	log_trace(" #### nano_ctx_send with ctx %p msg type %x #### ", ctx,
 	    nni_msg_get_type(msg));
-
-	pipeid = nni_aio_get_prov_data(aio);
-	if (pipeid)
-		pipe = *pipeid;
-	nni_aio_set_prov_data(aio, NULL);
 	if (ctx == &s->ctx) {
 		nni_pollable_clear(&s->writable);
 	}
@@ -416,13 +367,12 @@ nano_ctx_send(void *arg, nni_aio *aio)
 		// disrupting the state machine.  We don't care if the peer
 		// lost interest in our reply.
 		nni_mtx_unlock(&s->lk);
-		nni_aio_set_msg(aio, NULL);
 		if (qos_db == NULL) {
 			nni_atomic_inc64(&s->msgs_dropped);
 			log_debug("pipe id %u is gone, pub dropped", pipe);
 		}
 		nni_msg_free(msg);
-		return;
+		return (0);
 	}
 
 	// 2 locks here cause performance degradation
@@ -435,15 +385,7 @@ nano_ctx_send(void *arg, nni_aio *aio)
 		p->send_cmd = nni_msg_get_type(msg);
 		nni_pipe_send(p->pipe, &p->aio_send);
 		nni_mtx_unlock(&p->lk);
-		nni_aio_set_msg(aio, NULL);
-		return;
-	}
-
-	if ((rv = nni_aio_schedule(aio, nano_ctx_cancel_send, ctx)) != 0) {
-		nni_msg_free(msg);
-		nni_mtx_unlock(&p->lk);
-		nni_aio_set_msg(aio, NULL);
-		return;
+		return (0);
 	}
 	log_debug("pipe %d occupied! resending in cb!", pipe);
 	if (nni_lmq_full(&p->rlmq)) {
@@ -470,8 +412,7 @@ nano_ctx_send(void *arg, nni_aio *aio)
 				         "subsequent drops will not be logged", pipe);
 			}
 			nni_msg_free(msg);
-			nni_aio_set_msg(aio, NULL);
-			return;
+			return (0);
 		}
 	}
 
@@ -482,8 +423,33 @@ nano_ctx_send(void *arg, nni_aio *aio)
 		log_warn("pipe %u egress queue resize failed; "
 		         "subsequent drops will not be logged", pipe);
 	}
+	return (0);
+}
+
+static void
+nano_ctx_send(void *arg, nni_aio *aio)
+{
+	nano_ctx *ctx = arg;
+	nni_msg  *msg = nni_aio_get_msg(aio);
+	uint32_t  pipe = 0;
+	uint32_t *pipeid;
+	size_t    len;
+	int       rv;
+
+	if (nni_aio_begin(aio) != 0) {
+		log_error("Aio misused!");
+		return;
+	}
+
+	pipeid = nni_aio_get_prov_data(aio);
+	if (pipeid != NULL) {
+		pipe = *pipeid;
+	}
+	len = nni_msg_len(msg);
+	nni_aio_set_prov_data(aio, NULL);
 	nni_aio_set_msg(aio, NULL);
-	return;
+	rv = nano_ctx_send_msg(ctx, pipe, msg);
+	nni_aio_finish(aio, rv, rv == 0 ? len : 0);
 }
 
 static void
@@ -1550,6 +1516,25 @@ static nni_proto nano_tcp_proto = {
 	.proto_pipe_ops = &nano_pipe_ops,
 	.proto_ctx_ops  = &nano_ctx_ops,
 };
+
+int
+nng_nmq_broker_send(nng_ctx cid, uint32_t pipe, nng_msg *msg)
+{
+	nni_ctx  *nctx;
+	nano_ctx *ctx;
+	int       rv;
+
+	if (msg == NULL) {
+		return (NNG_EINVAL);
+	}
+	if ((rv = nni_ctx_find(&nctx, cid.id, false)) != 0) {
+		return (rv);
+	}
+	ctx = nni_ctx_proto_data(nctx);
+	rv  = nano_ctx_send_msg(ctx, pipe, msg);
+	nni_ctx_rele(nctx);
+	return (rv);
+}
 
 int
 nng_nmq_tcp0_open(nng_socket *sidp)

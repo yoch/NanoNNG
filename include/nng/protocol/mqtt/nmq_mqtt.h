@@ -16,6 +16,10 @@ extern "C" {
 
 NNG_DECL int nng_nmq_tcp0_open(nng_socket *);
 
+// Dispatches a message to one broker pipe without using a caller-owned AIO.
+// The function consumes msg on success. The caller retains ownership on error.
+NNG_DECL int nng_nmq_broker_send(nng_ctx, uint32_t, nng_msg *);
+
 #ifndef nng_nmq_tcp_open
 #define nng_nmq_tcp_open nng_nmq_tcp0_open
 #endif
